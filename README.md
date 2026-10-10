@@ -71,7 +71,11 @@ scripts/add_experience.py --workspace <path> \
 
 ### 4. 经验合并与清理（每 5-7 天）
 
-每 5-7 天运行一次 `merge_experiences.py`（cron 自动执行），处理以下情况：
+建议每 5-7 天运行一次 `merge_experiences.py`。
+
+> **不会自己触发**：本技能不含任何 cron / 调度器，需由调用方或外部平台驱动。脚本启动后全自动，无需人工介入。
+
+处理以下情况：
 
 | 类型 | 条件 | 处理方式 |
 |------|------|---------|
@@ -90,7 +94,15 @@ scripts/merge_experiences.py --workspace <path> --force-merge "file_a.md,file_b.
 # 自定义阈值 / 关闭备份（不推荐）
 scripts/merge_experiences.py --workspace <path> \
   --keyword-threshold 0.9 --content-threshold 0.9 --no-backup
+
+# 只调自动索引条目的判定（人工条目仍走严格阈值）
+scripts/merge_experiences.py --workspace <path> \
+  --auto-keyword-threshold 0.6 --auto-content-threshold 0.6
 ```
+
+**两级阈值**：同一 event_type 内两两比较，触发词与正文都达标才合并。人工条目双方都用 Jaccard ≥80%；只要有一方是自动索引条目，就改用重叠系数（交集/较小集）≥50% 且共享触发词 ≥3 个。原因是自动抽取的关键词噪声大，实测两个真重复文件在严格 Jaccard 下只有 7/9=0.778 而被漏掉；而"不应合并"的样本（含同域不同主题）最高只到 0.22/0.25。
+
+**同轮联动**：本轮补索引的文件立即进入本轮合并候选，重复文件第一次运行就合并。**不再静默**：被拒绝的组合会打印 `[BELOW TRIGGERS]` / `[BELOW CONTENT]` 并给出数值原因。
 
 合并是破坏性操作，三条硬约束：
 

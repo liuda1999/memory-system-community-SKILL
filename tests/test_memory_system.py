@@ -479,5 +479,98 @@ class TestAutoIndex(Workspace):
         self.assertIn("权重：0.5", mem, "merged entry mixing an auto member must stay lower-trust")
 
 
+class TestAutoMergeBehaviour(unittest.TestCase):
+    """Locks down the auto-merge fixes (overlap metric, same-round linkage,
+    observability, orphan-free index). Every case below was measured on the
+    shipped version before being fixed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "experience").mkdir()
+        (self.dir / "MEMORY.md").write_text("# Memory Index\n", encoding="utf-8")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _exp(self, name, event, date, summary, desc, design):
+        (self.dir / "experience" / name).write_text(
+            f"Event Type: lesson\nEvent Name: {event}\nDate: {date}\n"
+            f"Summary: {summary}\n\n"
+            f"## Full Description / Complete Resolution Process\n{desc}\n\n"
+            f"## Design / Solution\n{design}\n", encoding="utf-8")
+
+    def _files(self):
+        return sorted(p.name for p in (self.dir / "experience").glob("*.md"))
+
+    def _indexed(self):
+        import re
+        txt = (self.dir / "MEMORY.md").read_text(encoding="utf-8")
+        return sorted(set(re.findall(r"^\s*-\s+([\w\-.]+\.md)\s*$", txt, re.M)))
+
+    def test_auto_duplicates_merge_on_the_first_run(self):
+        """Measured: trigger Jaccard was 7/9 = 0.7778 (<0.8) so these duplicates
+        were skipped, AND even qualifying files needed a second invocation
+        because Phase 2 read the index before Phase 1 indexed anything."""
+        desc = "消费者组重平衡导致消费延迟抖动，调整分区数与拉取参数。"
+        for name, design in (("k_a.md", "调优拉取批次与提交策略。"),
+                             ("k_b.md", "增加消费者实例并错峰提交。")):
+            self._exp(name, "Kafka消费者组调优",
+                      "2026-04-0" + ("1" if name == "k_a.md" else "2"),
+                      "Kafka 消费者组并发调优与重平衡优化", desc, design)
+        proc = run("merge_experiences.py", "--workspace", str(self.dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        files = self._files()
+        self.assertEqual(len(files), 1, f"expected one merged file, got {files}")
+        self.assertEqual(self._indexed(), files,
+                         "index must not reference files that were merged away")
+
+    def test_rejections_are_printed_never_silent(self):
+        """Measured: a trigger-threshold miss did `continue` with no output, so
+        the run reported 'Nothing to do. ✓' while duplicates sat un-merged."""
+        self._exp("u1.md", "Redis缓存穿透", "2026-05-01",
+                  "Redis 缓存穿透用空值缓存与布隆过滤器解决",
+                  "热点 key 失效导致数据库压力骤增，引入布隆过滤器拦截无效查询。",
+                  "布隆过滤器加空值缓存。")
+        self._exp("u2.md", "Redis连接池调优", "2026-05-02",
+                  "Redis 连接池参数调优提升并发读取能力",
+                  "连接池过小导致请求排队阻塞，调整最大连接与回收策略。",
+                  "合理设置池大小与空闲回收时间。")
+        proc = run("merge_experiences.py", "--workspace", str(self.dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue("[BELOW TRIGGERS]" in proc.stdout
+                        or "[BELOW CONTENT]" in proc.stdout,
+                        "a rejected pair must be reported, not skipped silently")
+        self.assertEqual(len(self._files()), 2, "these two must not merge")
+
+    def test_same_domain_different_topic_still_separate(self):
+        """Guard: the looser auto threshold (0.5) must not merge files that
+        merely share a domain. Measured overlap 0.222/0.250."""
+        self._exp("s1.md", "Redis缓存穿透", "2026-05-01",
+                  "Redis 缓存穿透用空值缓存与布隆过滤器解决",
+                  "热点 key 失效导致数据库压力骤增，引入布隆过滤器拦截无效查询。",
+                  "布隆过滤器加空值缓存，设置较短过期时间。")
+        self._exp("s2.md", "Redis连接池调优", "2026-05-02",
+                  "Redis 连接池参数调优提升并发读取能力",
+                  "连接池过小导致请求排队阻塞，调整最大连接与回收策略。",
+                  "合理设置池大小与空闲回收时间。")
+        proc = run("merge_experiences.py", "--workspace", str(self.dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self._files()), 2, f"must stay separate: {self._files()}")
+
+    def test_overlap_and_jaccard_differ_as_intended(self):
+        """The two metrics must stay distinct: curated pairs keep strict
+        Jaccard, auto pairs use the inclusion-based overlap."""
+        mod = load("merge_experiences.py")
+        small, big = {1, 2, 3}, {1, 2, 3, 4}
+        self.assertAlmostEqual(mod.overlap_coefficient(small, big), 1.0)
+        self.assertAlmostEqual(mod.jaccard_similarity(small, big), 0.75)
+        self.assertEqual(mod.overlap_coefficient(set(), big), 0.0)
+        self.assertGreaterEqual(mod.MIN_SHARED_TRIGGERS, 1)
+        for name in ("AUTO_PAIR_KEYWORD_THRESHOLD", "AUTO_PAIR_CONTENT_THRESHOLD"):
+            self.assertTrue(hasattr(mod, name), f"{name} should be configurable")
+        self.assertLess(mod.AUTO_PAIR_KEYWORD_THRESHOLD,
+                        mod.AUTO_MERGE_KEYWORD_THRESHOLD,
+                        "auto threshold must be looser than the curated one")
+
+
 if __name__ == "__main__":
     unittest.main()

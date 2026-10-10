@@ -57,6 +57,29 @@ ARCHIVE_DIRNAME = ".archive"
 # findable when strongly relevant but prevents them from out-ranking curated
 # entries on a weak match. No manual calibration is required.
 AUTO_INDEX_WEIGHT = 0.5
+# When neither entry is auto-generated we keep strict Jaccard on both trigger
+# sets and content. For pairs where at least one entry is auto-generated we
+# switch to the overlap metric (see `overlap_coefficient`) because those keyword
+# sets are machine-extracted and carry stray tokens. Overlap alone can score
+# 1.0 on a tiny set that happens to be a subset of a large one, so we also
+# demand this many genuinely shared triggers before a pair can merge.
+MIN_SHARED_TRIGGERS = 3
+# ...and dedicated, lower thresholds for those noisy auto sets. 0.8 turns out to
+# be unreachable in practice: a file contributes a handful of distinctive tokens
+# (proper nouns from its Design section), and with only ~6 extracted tokens two
+# such tokens already cost 1/3 of the set, so genuine duplicates scored 0.67 and
+# silently never merged. These are deliberately separate so the curated path
+# keeps its strict behaviour.
+# Calibrated against measured pairs (see scripts notes): duplicates that SHOULD
+# merge scored 0.875/0.857 and 0.667/0.600 (trigger/content), while pairs that
+# must NOT merge - including the risky same-domain-but-different-topic case -
+# scored <= 0.222/0.250. The safe window is ~0.25..0.60; 0.5 sits in the middle
+# rather than flush against the top edge, so a duplicate marginally weaker than
+# the calibration samples still merges. A missed merge lets duplicates pile up,
+# whereas a false merge costs little: everything is archived and no content is
+# lost. Merges here are non-destructive by construction.
+AUTO_PAIR_KEYWORD_THRESHOLD = 0.5
+AUTO_PAIR_CONTENT_THRESHOLD = 0.5
 
 ENTRY_RE = re.compile(r"^\s*-\s+([\w\-.]+\.md)\s*$")
 KEYWORD_RE = re.compile(r"^.*触发关键词[：:](.*)$")
@@ -192,6 +215,28 @@ def jaccard_similarity(set1: set, set2: set) -> float:
     if not set1 or not set2:
         return 0.0
     return len(set1 & set2) / len(set1 | set2)
+
+
+def overlap_coefficient(set1: set, set2: set) -> float:
+    """|A∩B| / min(|A|,|B|) — what fraction of the SMALLER set is covered.
+
+    Jaccard divides by the union, so a single stray token added by a noisy
+    auto-generated keyword set drags the score down fast. Two 8-token trigger
+    sets that differ by exactly one token each score 7/9 = 0.78 — below the
+    0.8 threshold — even though the topics plainly overlap, and the pair then
+    silently never merges. Overlap asks the right question for noisy sets: is
+    the smaller set (mostly) contained in the other?
+    """
+    if not set1 or not set2:
+        return 0.0
+    return len(set1 & set2) / min(len(set1), len(set2))
+
+
+def content_similarity_overlap(a: dict, b: dict) -> float:
+    """Content comparison using the overlap metric (see `overlap_coefficient`)."""
+    kw_a = set(extract_keywords_from_experience(a)[:KEYWORD_SAMPLE])
+    kw_b = set(extract_keywords_from_experience(b)[:KEYWORD_SAMPLE])
+    return overlap_coefficient(kw_a, kw_b)
 
 
 def extract_keywords_from_experience(pf: dict, limit: int = 12) -> list[str]:
@@ -343,6 +388,14 @@ def main() -> int:
                         help="Delete sources without archiving them first (not recommended)")
     parser.add_argument("--keyword-threshold", type=float, default=AUTO_MERGE_KEYWORD_THRESHOLD)
     parser.add_argument("--content-threshold", type=float, default=AUTO_MERGE_CONTENT_THRESHOLD)
+    parser.add_argument("--auto-keyword-threshold", type=float,
+                        default=AUTO_PAIR_KEYWORD_THRESHOLD,
+                        help="Trigger overlap required when either entry is auto-generated "
+                             f"(overlap metric, default {AUTO_PAIR_KEYWORD_THRESHOLD})")
+    parser.add_argument("--auto-content-threshold", type=float,
+                        default=AUTO_PAIR_CONTENT_THRESHOLD,
+                        help="Content overlap required when either entry is auto-generated "
+                             f"(overlap metric, default {AUTO_PAIR_CONTENT_THRESHOLD})")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -394,6 +447,13 @@ def main() -> int:
                 print(f"  [BROKEN] '{fname}' — {extra}missing fields: "
                       f"{', '.join(pf['missing_fields'])}")
             elif fname not in indexed_files:
+                # Build the auto-index payload ONCE, here, so Phase 2 can
+                # consider this file for merging in the SAME run (previously a
+                # brand-new duplicate needed a second invocation to merge) and
+                # Phase 3 writes exactly what Phase 2 assumed.
+                pf["keywords"] = extract_keywords_from_experience(pf)
+                pf["conditions"] = [pf.get("event_name") or fname.removesuffix(".md")]
+                pf["weight"] = AUTO_INDEX_WEIGHT
                 unindexed_files.append(pf)
                 print(f"  [UNINDEXED] '{fname}' — will auto-index")
 
@@ -407,6 +467,8 @@ def main() -> int:
     print("=" * 60)
     kw_t = args.keyword_threshold
     ct_t = args.content_threshold
+    auto_kw_t = args.auto_keyword_threshold
+    auto_ct_t = args.auto_content_threshold
     print(f"Phase 2: Find merge candidates (triggers ≥{kw_t:.0%}, content ≥{ct_t:.0%})")
     print("=" * 60)
 
@@ -423,6 +485,11 @@ def main() -> int:
         pf["conditions"] = entry["conditions"]
         pf["weight"] = entry.get("weight", 1.0)
         parsed_files.append(pf)
+
+    # Files auto-indexed during THIS run join the merge pool immediately, so a
+    # duplicate dropped into experience/ merges on the first run instead of
+    # silently waiting for a second invocation.
+    parsed_files.extend(unindexed_files)
 
     by_name = {p["filename"]: p for p in parsed_files}
     pairs: list[tuple[str, str]] = []
@@ -450,18 +517,57 @@ def main() -> int:
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
                     a, b = group[i], group[j]
-                    t_sim = trigger_similarity(a, b)
-                    if t_sim < kw_t:
+                    ta = set(a.get("keywords", [])) | set(a.get("conditions", []))
+                    tb = set(b.get("keywords", [])) | set(b.get("conditions", []))
+                    shared = len(ta & tb)
+
+                    # Machine-extracted trigger sets carry stray tokens, so
+                    # Jaccard (union denominator) punishes them hard: two
+                    # 8-token sets differing by one token each score 7/9=0.78
+                    # and never merge despite being duplicates. Use the overlap
+                    # metric for those pairs, plus a shared-token floor so a
+                    # tiny set that happens to nest inside a big one cannot
+                    # trigger a destructive merge.
+                    auto_pair = (float(a.get("weight", 1.0)) < 1.0
+                                 or float(b.get("weight", 1.0)) < 1.0)
+                    if auto_pair:
+                        t_sim = overlap_coefficient(ta, tb)
+                        metric = "overlap"
+                        enough_shared = shared >= MIN_SHARED_TRIGGERS
+                        t_th, c_th = auto_kw_t, auto_ct_t
+                    else:
+                        t_sim = jaccard_similarity(ta, tb)
+                        metric = "jaccard"
+                        enough_shared = True
+                        t_th, c_th = kw_t, ct_t
+
+                    if t_sim < t_th or not enough_shared:
+                        # This used to `continue` in SILENCE, so a run ended
+                        # with "Nothing to do. ✓" while near-duplicates sat
+                        # un-merged. Always report why a pair was rejected.
+                        reason = (f"only {shared} shared trigger(s), "
+                                  f"need {MIN_SHARED_TRIGGERS}"
+                                  if not enough_shared
+                                  else f"triggers below {t_th:.0%}")
+                        print(f"  [BELOW TRIGGERS] {a['filename']} ↔ "
+                              f"{b['filename']} — {reason}")
+                        print(f"      Triggers: {t_sim:.0%} ({metric}, need "
+                              f"{t_th:.0%}), shared: {shared}")
                         continue
-                    c_sim = content_similarity(a, b)
-                    if c_sim < ct_t:
-                        print(f"  [BELOW THRESHOLD] {a['filename']} ↔ {b['filename']}")
-                        print(f"      Triggers: {t_sim:.0%}, Content: {c_sim:.0%}")
+
+                    c_sim = (content_similarity_overlap(a, b) if auto_pair
+                             else content_similarity(a, b))
+                    if c_sim < c_th:
+                        print(f"  [BELOW CONTENT] {a['filename']} ↔ {b['filename']}")
+                        print(f"      Triggers: {t_sim:.0%}, Content: {c_sim:.0%} "
+                              f"({metric}, need {c_th:.0%})")
                         continue
+
                     pairs.append((a["filename"], b["filename"]))
                     pair_detail[(a["filename"], b["filename"])] = (t_sim, c_sim)
                     print(f"  ✓ {a['filename']} ↔ {b['filename']}")
-                    print(f"      Triggers: {t_sim:.0%}, Content: {c_sim:.0%}")
+                    print(f"      Triggers: {t_sim:.0%}, Content: {c_sim:.0%} "
+                          f"({metric})")
 
     groups = [g for g in cluster(list(by_name), pairs) if len(g) > 1]
 
@@ -496,15 +602,13 @@ def main() -> int:
         print("Phase 3: ② Auto-indexing unindexed experience files")
         print("=" * 60)
         for pf in unindexed_files:
-            keywords = extract_keywords_from_experience(pf)
-            # A placeholder like "关于<name>的事项" carries no real trigger
-            # semantics. Use the event name (or filename stem) as the condition:
-            # it fires when a task mentions the topic, which is meaningful.
-            topic = pf.get("event_name") or pf["filename"].removesuffix(".md")
-            conditions = [topic]
-            entries_to_add.append((pf["filename"], keywords, conditions, AUTO_INDEX_WEIGHT))
-            print(f"  Indexed: {pf['filename']} ({len(keywords)} keywords, "
-                  f"auto-generated, weight {AUTO_INDEX_WEIGHT})")
+            # Reuse the payload Phase 1 built (and Phase 2 judged) so what gets
+            # written can never diverge from what was used to decide.
+            entries_to_add.append(
+                (pf["filename"], pf["keywords"], pf["conditions"], pf["weight"])
+            )
+            print(f"  Indexed: {pf['filename']} ({len(pf['keywords'])} keywords, "
+                  f"auto-generated, weight {pf['weight']})")
 
     merge_count = 0
     if groups:
@@ -514,6 +618,14 @@ def main() -> int:
         print("=" * 60)
         for group in groups:
             members = [by_name[n] for n in group]
+            # A member may have been queued for auto-indexing earlier in this
+            # run. It is about to be merged away, so drop that pending entry —
+            # otherwise the rebuilt MEMORY.md would point at a file that no
+            # longer exists.
+            member_names = {m["filename"] for m in members}
+            entries_to_add[:] = [e for e in entries_to_add
+                                 if e[0] not in member_names]
+
             content, new_filename, keywords, conditions, merged_weight = build_merged_content(members)
 
             target = exp_dir / new_filename
