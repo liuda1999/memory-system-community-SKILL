@@ -199,7 +199,10 @@ def main():
     parser.add_argument("--workspace", required=True, help="Path to workspace directory")
     parser.add_argument("--interactive", action="store_true", help="Run in interactive mode")
     parser.add_argument("--event-type", choices=sorted(VALID_EVENT_TYPES), help="Type of event")
-    parser.add_argument("--event-name", help="Name of the event (snake_case)")
+    parser.add_argument("--event-name",
+                        help="Name of the event; Chinese is kept as-is "
+                             "(only path separators and Windows reserved "
+                             "chars are stripped)")
     parser.add_argument("--summary", help="One-line summary")
     parser.add_argument("--description", help="Full description / resolution")
     parser.add_argument("--design", help="Design and solution details")

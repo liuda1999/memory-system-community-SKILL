@@ -7,6 +7,17 @@ description: "Multi-layered memory management for personal AI workspaces. Suppor
 
 三层记忆架构：原始日志 → 分解索引 → 经验归档。用于 AI 会话的持久化记忆管理。
 
+> **相对原始版本（SKILL 标签）的破坏性变更 — 调用方必须改动**
+> `append_turn.py` / `daily_log.py` **不再接受命令行里的对话正文**。原版用法会被拒绝并报错退出：
+> ```text
+> # 旧写法（已失效，会报 unrecognized arguments）
+> python3 scripts/append_turn.py <workspace-path> "<用户消息>" "<回复>"
+> scripts/daily_log.py --workspace <path> --user-msg "..." --reply "..."
+> ```
+> 新写法见下节：正文一律走 `--user-file` / `--reply-file` / `--stdin`。
+> 改的原因不是偏好——正文里出现 `$(...)` 会被 shell 展开，实测旧版真的执行了注入载荷。
+> 其余所有流程（five 步、文件格式、事件类型）保持不变。
+
 ## 核心流程
 
 ### 1. 每轮日志记录（强制实时 + 自动触发）
@@ -83,13 +94,26 @@ scripts/add_experience.py \
 
 建议每 5-7 天运行一次 `merge_experiences.py` 检查经验文件健康状况。
 
-> **不会自己触发（重要）**：本技能**不含任何 cron / 调度器 / 钩子**，不会定时自动运行。必须由使用方按本文件约定发起调用（AI 会话周期性执行），或由外部平台（cron / systemd / 基础 agent 平台的定时任务）驱动。脚本一旦启动则**全自动**：无需人工确认，自动处理以下情况。
+> **不会自己触发（重要）**：本技能**不含任何 cron / 调度器 / 钩子**，不会定时自动运行。必须由使用方按本文件约定发起调用（AI 会话周期性执行），或由外部平台驱动。脚本一旦启动则**全自动**：无需人工确认，自动处理以下情况。
+>
+> **如何让它真的周期跑起来（二选一，技能本体不提供调度）**
+>
+> ```bash
+> # A. 系统 cron：每周一 04:15 跑一次健康检查
+> 15 4 * * 1 /usr/bin/python3 /path/to/skills/memory-system/scripts/merge_experiences.py \
+>     --workspace /path/to/workspace >> /tmp/memory-merge.log 2>&1
+>
+> # B. systemd timer：memory-merge.service + memory-merge.timer（OnCalendar=weekly）
+> systemctl --user enable --now memory-merge.timer
+> ```
+>
+> 注意：`merge_experiences.py` 需要 `--workspace` 绝对路径；正文类脚本（`append_turn.py` / `daily_log.py`）**只能在对话当下调用**，不适合排进 cron。
 
 | 类型 | 条件 | 处理方式 |
 |------|------|---------|
 | ① 孤儿索引 | 文件已删，MEMORY.md 还挂着 | **自动清理** — 移除无用索引 |
 | ② 未索引文件 | experience/ 存在但 MEMORY.md 没记 | **自动索引** — 解析 header，用优化过的中文分词提取词级关键词（无碎片），触发条件用事件名，并以 `权重：0.5` 标记（自动降权，不要求人工校准） |
-| ③ 高度相似 | 关键词/条件 ≥80% **且** 内容关键词 ≥80%，同类任务 | **自动合并** — 无声执行，新文件保留身份，旧内容追加 |
+| ③ 高度相似 | 同 event_type；**人工条目**：触发词/条件 ≥80% 且 内容 ≥80%；**含自动索引条目**：走下方「两级阈值」（重叠系数 ≥50%） | **自动合并** — 最新文件保留身份，其余成员内容全部追加 |
 | ④ 破损文件 | header 字段缺失 | **报告留痕** — 列出具体缺失字段，不做自动操作 |
 
 ```bash
@@ -149,7 +173,7 @@ scripts/startup_scan.py \
 
 匹配的经验文件路径会打印出来。读取匹配文件的 Summary 和 Event Type，判断是否需要加载完整内容。
 
-`--min-matches N`（默认 1）要求至少命中 N 个触发词才列出。分数是"命中占比"，触发词写得越多的条目占比越低，所以过滤要看命中数而不只是占比。自动索引的条目（权重 0.5）分数会被乘权重，弱匹配时不会压过人工条目，但强相关时仍会返回。
+`--min-matches N`（默认 1）要求至少命中 N 个触发词才列出；`--min-score S`（默认 0.05）按命中占比下限过滤；`--max-results M`（默认 5）限制返回条数。分数是"命中占比"，触发词写得越多的条目占比越低，所以过滤要看命中数而不只是占比。自动索引的条目（权重 0.5）分数会被乘权重，弱匹配时不会压过人工条目，但强相关时仍会返回。
 
 ## 文件格式
 

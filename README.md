@@ -2,6 +2,11 @@
 
 三层记忆架构：原始日志 → 分解索引 → 经验归档。用于 AI 会话的持久化记忆管理。
 
+> **相对原始版本（SKILL 标签）的破坏性变更**：`append_turn.py` / `daily_log.py` **不再接受命令行里的对话正文**。
+> 旧写法 `append_turn.py <ws> "<用户消息>" "<回复>"` 与 `daily_log.py --user-msg "..." --reply "..."`
+> 均已被移除（会以 argparse 错误退出）。改成 `--user-file` / `--reply-file` / `--stdin`，见下节。
+> 原因：正文里的 `$(...)` 会被 shell 展开，旧版实测确实执行了注入载荷。其余流程不变。
+
 仓库里的 `scripts/` 与 `references/` 就是技能本体，可直接复制进 `~/.workbuddy/skills/`
 （或其他智能体的技能目录）。`memory-system-community.tar.gz` 是同一个内容的打包版。
 
@@ -74,6 +79,19 @@ scripts/add_experience.py --workspace <path> \
 建议每 5-7 天运行一次 `merge_experiences.py`。
 
 > **不会自己触发**：本技能不含任何 cron / 调度器，需由调用方或外部平台驱动。脚本启动后全自动，无需人工介入。
+>
+> 想要真的周期跑起来（技能本体不含调度，二选一）：
+>
+> ```bash
+> # A. 系统 cron：每周一 04:15
+> 15 4 * * 1 /usr/bin/python3 /path/to/skills/memory-system/scripts/merge_experiences.py \
+>     --workspace /path/to/workspace >> /tmp/memory-merge.log 2>&1
+>
+> # B. systemd timer：service + timer（OnCalendar=weekly）
+> systemctl --user enable --now memory-merge.timer
+> ```
+>
+> 只有 `merge_experiences.py` 适合排期；`append_turn.py` / `daily_log.py` 必须在对话当下调用。
 
 处理以下情况：
 
@@ -81,7 +99,7 @@ scripts/add_experience.py --workspace <path> \
 |------|------|---------|
 | ① 孤儿索引 | 文件已删，MEMORY.md 还挂着 | **自动清理** — 移除无用索引 |
 | ② 未索引文件 | experience/ 存在但 MEMORY.md 没记 | **自动索引** — 解析 header，用优化过的中文分词提取词级关键词（无碎片），触发条件用事件名，并以 `权重：0.5` 标记（自动降权，不要求人工校准） |
-| ③ 高度相似 | 关键词/条件 ≥80% **且** 内容关键词 ≥80%，同类任务 | **自动合并** — 最新文件保留身份，其余成员内容全部追加 |
+| ③ 高度相似 | 同 event_type；**人工条目**：触发词/条件 ≥80% 且 内容 ≥80%；**含自动索引条目**：走下方「两级阈值」（重叠系数 ≥50%） | **自动合并** — 最新文件保留身份，其余成员内容全部追加 |
 | ④ 破损文件 | header 字段缺失 | **报告留痕** — 列出具体缺失字段，不做自动操作 |
 
 ```bash
@@ -117,7 +135,8 @@ scripts/merge_experiences.py --workspace <path> \
 scripts/startup_scan.py --workspace <workspace-path> --task "<当前任务描述>"
 ```
 
-匹配的经验文件路径会打印出来。`--min-matches N`（默认 1）要求至少命中 N 个触发词。
+匹配的经验文件路径会打印出来。`--min-matches N`（默认 1）要求至少命中 N 个触发词；
+`--min-score S`（默认 0.05）按命中占比过滤；`--max-results M`（默认 5）限制返回条数。
 分数是"命中占比"，触发词写得越多的条目占比越低，所以过滤要看命中数而不只是占比。
 自动索引的条目（权重 0.5）分数会被乘权重，弱匹配时不会压过人工条目，但强相关时仍会返回。
 
